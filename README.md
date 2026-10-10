@@ -13,6 +13,7 @@ https://github.com/user-attachments/assets/419d3e50-c933-444b-8cab-a9724986ba05
 
 - Download videos from 1000+ supported sites (via [yt-dlp](https://github.com/yt-dlp/yt-dlp))
 - MP4 video or MP3 audio extraction
+- MP4 compatibility: H.264 video, AAC audio, and fast-start playback; compatible streams are copied without re-encoding
 - Quality/resolution picker
 - Bulk downloads — paste multiple URLs at once
 - Automatic URL deduplication
@@ -56,6 +57,15 @@ YouTube, TikTok, Instagram, Twitter/X, Reddit, Facebook, Vimeo, Twitch, Dailymot
 - **Frontend:** Vanilla HTML/CSS/JS (single file, no build step)
 - **Download engine:** [yt-dlp](https://github.com/yt-dlp/yt-dlp) + [ffmpeg](https://ffmpeg.org/)
 - **Dependencies:** 2 (Flask, yt-dlp)
+
+## Validation
+
+With the Python dependencies and FFmpeg installed, run `python -m unittest discover -s tests -v`.
+The media tests generate short fixtures and verify the output codecs and playback decoding.
+Run `node tests/test_download_ui.cjs` to check that the browser rejects failed or non-media file responses before starting a save.
+
+Video conversion runs before a download is marked ready. If conversion takes too long,
+try a lower resolution. MP3 downloads skip this step.
 
 ## Disclaimer
 
