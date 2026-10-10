@@ -122,6 +122,27 @@ class DownloadResponseTests(unittest.TestCase):
         self.assertEqual(reclip.jobs["keep"]["status"], "done")
         self.assertTrue(kept.exists())
 
+    def test_cover_art_listed_first_is_not_mapped_as_the_video(self):
+        source = Path(self.directory.name) / "cover_first.mp4"
+        source.write_bytes(b"media")
+        cover = {"index": 0, "codec_type": "video", "codec_name": "png", "disposition": {"attached_pic": 1}}
+        video = {"index": 1, "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+                 "profile": "High", "disposition": {"attached_pic": 0}}
+        audio = {"index": 2, "codec_type": "audio", "codec_name": "aac", "profile": "LC"}
+        commands = []
+
+        def fake_ffmpeg(cmd, **kwargs):
+            commands.append(cmd)
+            Path(cmd[-1]).write_bytes(b"converted")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(reclip, "probe_media", side_effect=[[cover, video, audio], [video, audio]]),                 patch.object(reclip.subprocess, "run", side_effect=fake_ffmpeg):
+            reclip.ensure_compatible_mp4(source)
+        command = commands[0]
+        self.assertEqual(command[command.index("-map") + 1], "0:1", "must map the real video, not the cover")
+        self.assertNotIn("0:0", command)
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+
     def test_partial_files_are_never_published(self):
         reclip.jobs["partial"] = {"status": "downloading", "title": "Video"}
         (Path(self.directory.name) / "partial.mp4.part").write_bytes(b"incomplete")
@@ -173,6 +194,7 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
             <iframe src="//ads.example/frame"></iframe>
             <iframe src="javascript:alert(1)"></iframe>
             <iframe src="/relative/player"></iframe>
+            <iframe src="https://cdn.example/embed/77/"></iframe>
             <meta property="og:video" content="https://player.example/embed/9/">
             <meta property="og:video" content="https://player.example/embed/9/">
             <iframe></iframe>
@@ -181,9 +203,14 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
             urls = reclip.find_embed_urls(self.PAGE)
         self.assertEqual(urls, [
             "https://player.example/embed/9/",
-            "https://ads.example/frame",
             "https://site.example/relative/player",
+            "https://cdn.example/embed/77/",
         ])
+
+    def test_unrelated_iframes_are_never_treated_as_the_video(self):
+        html = '<iframe src="https://ads.example/banner"></iframe><iframe src="https://track.example/x"></iframe>'
+        with self.fake_page(html):
+            self.assertEqual(reclip.find_embed_urls(self.PAGE), [])
 
     def test_unreachable_page_yields_no_embeds(self):
         with patch.object(reclip.urllib.request, "urlopen", side_effect=OSError("down")):

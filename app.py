@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import glob
 import json
@@ -27,6 +28,7 @@ NON_VIDEO_SUFFIXES = {
 DOWNLOAD_TIMEOUT = int(os.environ.get("RECLIP_DOWNLOAD_TIMEOUT", 300))
 MAX_EMBEDS = 3
 MAX_PAGE_BYTES = 2_000_000
+PLAYER_HINT = re.compile(r"embed|player", re.I)
 PLAYER_META = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player"}
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
@@ -48,7 +50,12 @@ class EmbedFinder(HTMLParser):
 
 
 def find_embed_urls(page_url):
-    """Return http(s) player URLs embedded in a page, explicit video metas first."""
+    """Return http(s) player URLs embedded in a page.
+
+    og:video / twitter:player metas name the page's main video, so they come first and are
+    always kept. A bare iframe is only kept when its URL looks like a player (embed/player),
+    which keeps advertising frames from being mistaken for the video.
+    """
     try:
         req = urllib.request.Request(page_url, headers={"User-Agent": BROWSER_UA})
         with urllib.request.urlopen(req, timeout=15) as response:
@@ -59,10 +66,12 @@ def find_embed_urls(page_url):
     finder = EmbedFinder()
     finder.feed(html)
     found = []
-    for raw in finder.players + finder.frames:
+    for raw, explicit in [(r, True) for r in finder.players] + [(r, False) for r in finder.frames]:
         absolute = urljoin(page_url, raw.strip()) if raw else None
-        if (absolute and urlparse(absolute).scheme in {"http", "https"}
-                and absolute != page_url and absolute not in found):
+        if not absolute or absolute == page_url or absolute in found:
+            continue
+        parsed = urlparse(absolute)
+        if parsed.scheme in {"http", "https"} and (explicit or PLAYER_HINT.search(parsed.netloc + parsed.path)):
             found.append(absolute)
     return found[:MAX_EMBEDS]
 
@@ -114,9 +123,11 @@ def ensure_compatible_mp4(filename):
     """Produce H.264/AAC MP4; copy streams that already meet the requirements."""
     source = Path(filename)
     streams = probe_media(source)
-    video = next((s for s in streams if s["codec_type"] == "video"), None)
+    # Cover art is stored as a video stream flagged attached_pic; it is not the video.
+    video = next((s for s in streams if s["codec_type"] == "video"
+                  and not s.get("disposition", {}).get("attached_pic")), None)
     audio = next((s for s in streams if s["codec_type"] == "audio"), None)
-    if not video or video.get("disposition", {}).get("attached_pic"):
+    if not video:
         raise RuntimeError("The downloaded file has no video track.")
     copy_video = (
         video.get("codec_name") == "h264" and video.get("pix_fmt") == "yuv420p"
@@ -126,7 +137,7 @@ def ensure_compatible_mp4(filename):
     target = source.with_suffix(".mp4")
     temporary = source.with_name(source.stem + ".compatible.mp4")
     cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source),
-           "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy" if copy_video else "libx264"]
+           "-map", f"0:{video['index']}", "-map", "0:a:0?", "-c:v", "copy" if copy_video else "libx264"]
     if not copy_video:
         cmd += ["-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                 "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-threads", "2"]
