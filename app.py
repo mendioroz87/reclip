@@ -4,7 +4,11 @@ import glob
 import json
 import subprocess
 import threading
+import time
+import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
@@ -18,6 +22,74 @@ NON_VIDEO_SUFFIXES = {
     ".part", ".ytdl", ".temp", ".tmp", ".json", ".description", ".txt",
     ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt", ".ass", ".lrc",
 }
+
+# Seconds yt-dlp may spend downloading one video. Slow hosts need more.
+DOWNLOAD_TIMEOUT = int(os.environ.get("RECLIP_DOWNLOAD_TIMEOUT", 300))
+MAX_EMBEDS = 3
+MAX_PAGE_BYTES = 2_000_000
+PLAYER_META = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player"}
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+
+
+class EmbedFinder(HTMLParser):
+    """Collect the players a page embeds: og:video / twitter:player metas and iframes."""
+
+    def __init__(self):
+        super().__init__()
+        self.players = []
+        self.frames = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "iframe":
+            self.frames.append(attrs.get("src"))
+        elif tag == "meta" and (attrs.get("property") or attrs.get("name")) in PLAYER_META:
+            self.players.append(attrs.get("content"))
+
+
+def find_embed_urls(page_url):
+    """Return http(s) player URLs embedded in a page, explicit video metas first."""
+    try:
+        req = urllib.request.Request(page_url, headers={"User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            html = response.read(MAX_PAGE_BYTES).decode(charset, "replace")
+    except Exception:
+        return []
+    finder = EmbedFinder()
+    finder.feed(html)
+    found = []
+    for raw in finder.players + finder.frames:
+        absolute = urljoin(page_url, raw.strip()) if raw else None
+        if (absolute and urlparse(absolute).scheme in {"http", "https"}
+                and absolute != page_url and absolute not in found):
+            found.append(absolute)
+    return found[:MAX_EMBEDS]
+
+
+def run_ytdlp(args, url, timeout):
+    """Run yt-dlp on ``url``; if the page itself is unsupported, retry on the videos it embeds.
+
+    Sites without an extractor often just wrap a player from another host in an
+    iframe, which yt-dlp can extract when given that player URL and the page as Referer.
+    """
+    deadline = time.monotonic() + timeout
+
+    def run(extra, target):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("yt-dlp", timeout)
+        return subprocess.run(["yt-dlp", *args, *extra, target],
+                              capture_output=True, text=True, timeout=remaining)
+
+    result = run([], url)
+    if result.returncode == 0 or "Unsupported URL" not in result.stderr:
+        return result
+    for embed in find_embed_urls(url):
+        retry = run(["--referer", url], embed)
+        if retry.returncode == 0:
+            return retry
+    return result
 
 
 def safe_filename(title, extension, fallback):
@@ -101,19 +173,17 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    args = ["--no-playlist", "-o", out_template]
 
     if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
+        args += ["-x", "--audio-format", "mp3"]
     elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
+        args += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
     else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
+        args += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = run_ytdlp(args, url, DOWNLOAD_TIMEOUT)
         if result.returncode != 0:
             job["status"] = "error"
             job["error"] = result.stderr.strip().split("\n")[-1]
@@ -172,9 +242,8 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = run_ytdlp(["--no-playlist", "-j"], url, 60)
         if result.returncode != 0:
             return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
 

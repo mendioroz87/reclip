@@ -117,6 +117,66 @@ class DownloadResponseTests(unittest.TestCase):
         self.assertEqual(reclip.jobs["audio"]["filename"], "Audio.mp3")
 
 
+class EmbeddedPlayerFallbackTests(unittest.TestCase):
+    PAGE = "https://site.example/video/1/clip/"
+
+    def fake_page(self, html):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = html.encode()
+        response.headers.get_content_charset.return_value = "utf-8"
+        return patch.object(reclip.urllib.request, "urlopen", return_value=response)
+
+    def test_embeds_are_found_metas_first_resolved_and_filtered(self):
+        html = """
+            <iframe src="//ads.example/frame"></iframe>
+            <iframe src="javascript:alert(1)"></iframe>
+            <iframe src="/relative/player"></iframe>
+            <meta property="og:video" content="https://player.example/embed/9/">
+            <meta property="og:video" content="https://player.example/embed/9/">
+            <iframe></iframe>
+        """
+        with self.fake_page(html):
+            urls = reclip.find_embed_urls(self.PAGE)
+        self.assertEqual(urls, [
+            "https://player.example/embed/9/",
+            "https://ads.example/frame",
+            "https://site.example/relative/player",
+        ])
+
+    def test_unreachable_page_yields_no_embeds(self):
+        with patch.object(reclip.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertEqual(reclip.find_embed_urls(self.PAGE), [])
+
+    def completed(self, code, stderr=""):
+        return subprocess.CompletedProcess([], code, "{}", stderr)
+
+    def test_unsupported_page_retries_embed_with_referer(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return self.completed(1, "ERROR: Unsupported URL: x") if cmd[-1] == self.PAGE else self.completed(0)
+
+        with patch.object(reclip, "find_embed_urls", return_value=["https://p.example/a", "https://p.example/b"]), \
+                patch.object(reclip.subprocess, "run", side_effect=fake_run):
+            result = reclip.run_ytdlp(["--no-playlist", "-j"], self.PAGE, 60)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(calls[-1], ["yt-dlp", "--no-playlist", "-j", "--referer", self.PAGE, "https://p.example/a"])
+        self.assertEqual(len(calls), 2)
+
+    def test_other_errors_do_not_trigger_embed_search(self):
+        with patch.object(reclip, "find_embed_urls", side_effect=AssertionError("must not search")), \
+                patch.object(reclip.subprocess, "run", return_value=self.completed(1, "ERROR: HTTP Error 403")):
+            self.assertEqual(reclip.run_ytdlp([], self.PAGE, 60).returncode, 1)
+
+    def test_original_error_is_reported_when_no_embed_works(self):
+        with patch.object(reclip, "find_embed_urls", return_value=["https://p.example/a"]), \
+                patch.object(reclip.subprocess, "run", return_value=self.completed(1, "ERROR: Unsupported URL: x")):
+            result = reclip.run_ytdlp([], self.PAGE, 60)
+        self.assertIn("Unsupported URL", result.stderr)
+
+
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg and ffprobe required")
 class MediaCompatibilityTests(unittest.TestCase):
     def setUp(self):

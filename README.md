@@ -51,6 +51,12 @@ Anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supporte
 
 YouTube, TikTok, Instagram, Twitter/X, Reddit, Facebook, Vimeo, Twitch, Dailymotion, SoundCloud, Loom, Streamable, Pinterest, Tumblr, Threads, LinkedIn, and many more.
 
+If a page has no extractor of its own but embeds a player from another host (an `<iframe>` or
+`og:video` tag), ReClip retries yt-dlp on that player, using the page as the `Referer`.
+
+Downloads from slow hosts can exceed the default 5-minute limit; raise it with
+`RECLIP_DOWNLOAD_TIMEOUT` (seconds).
+
 ## Stack
 
 - **Backend:** Python + Flask (~150 lines)
