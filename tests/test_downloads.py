@@ -89,6 +89,23 @@ class DownloadResponseTests(unittest.TestCase):
             reclip.run_download("partial", "https://example.org/video", "video", None)
         self.assertEqual(reclip.jobs["partial"]["status"], "error")
 
+    def test_less_common_containers_are_sent_to_conversion_not_rejected(self):
+        for suffix in (".m4v", ".3gp", ".ts"):
+            with self.subTest(suffix=suffix):
+                job_id = "container" + suffix.strip(".")
+                reclip.jobs[job_id] = {"status": "downloading", "title": "Clip"}
+                source = Path(self.directory.name) / f"{job_id}{suffix}"
+                source.write_bytes(b"media")
+                (Path(self.directory.name) / f"{job_id}.jpg").write_bytes(b"thumbnail")
+                converted = Path(self.directory.name) / f"{job_id}.mp4"
+                with patch.object(reclip, "DOWNLOAD_DIR", self.directory.name), \
+                        patch.object(reclip.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                        patch.object(reclip, "ensure_compatible_mp4", return_value=str(converted)) as convert:
+                    reclip.run_download(job_id, "https://example.org/video", "video", None)
+                convert.assert_called_once_with(str(source))
+                self.assertEqual(reclip.jobs[job_id]["status"], "done")
+                self.assertEqual(reclip.jobs[job_id]["filename"], "Clip.mp4")
+
     def test_mp3_download_skips_video_conversion(self):
         reclip.jobs["audio"] = {"status": "downloading", "title": "Audio"}
         (Path(self.directory.name) / "audio.mp3").write_bytes(b"audio")

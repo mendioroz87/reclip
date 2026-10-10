@@ -13,6 +13,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 jobs = {}
 
+# Partial downloads and sidecar files yt-dlp may leave next to the finished video.
+NON_VIDEO_SUFFIXES = {
+    ".part", ".ytdl", ".temp", ".tmp", ".json", ".description", ".txt",
+    ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt", ".ass", ".lrc",
+}
+
 
 def safe_filename(title, extension, fallback):
     """Build a title-based filename that is safe for a download header."""
@@ -125,11 +131,15 @@ def run_download(job_id, url, format_choice, format_id):
                 raise RuntimeError("Download completed but no MP3 file was found")
             chosen = target[0]
         else:
-            target = [f for f in files if f.endswith(".mp4")]
-            completed = [f for f in files if Path(f).suffix.lower() in {".mp4", ".webm", ".mkv", ".mov", ".flv", ".avi"}]
+            # Any container yt-dlp leaves behind (.m4v, .3gp, .ts, ...) is a candidate;
+            # ffprobe in ensure_compatible_mp4 decides whether it is really video.
+            completed = sorted(
+                (f for f in files if Path(f).suffix.lower() not in NON_VIDEO_SUFFIXES),
+                key=lambda f: Path(f).suffix.lower() != ".mp4",
+            )
             if not completed:
                 raise RuntimeError("Download completed but no video file was found")
-            chosen = ensure_compatible_mp4(target[0] if target else completed[0])
+            chosen = ensure_compatible_mp4(completed[0])
 
         for f in files:
             if f != chosen:
