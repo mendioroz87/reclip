@@ -81,6 +81,47 @@ class DownloadResponseTests(unittest.TestCase):
         self.assertEqual(reclip.jobs["failed"]["status"], "error")
         self.assertNotIn("file", reclip.jobs["failed"])
 
+    def test_failed_jobs_leave_no_files_behind(self):
+        failures = {
+            "convert": dict(ensure=RuntimeError("Conversion failed")),
+            "timeout": dict(ensure=subprocess.TimeoutExpired("ffmpeg", 600)),
+        }
+        for name, failure in failures.items():
+            with self.subTest(name):
+                job_id = "leak" + name
+                reclip.jobs[job_id] = {"status": "downloading", "title": "Video"}
+                files = [Path(self.directory.name) / f"{job_id}.{suffix}" for suffix in ("webm", "mp4.part", "jpg")]
+                for file in files:
+                    file.write_bytes(b"media")
+                with patch.object(reclip, "DOWNLOAD_DIR", self.directory.name), \
+                        patch.object(reclip.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                        patch.object(reclip, "ensure_compatible_mp4", side_effect=failure["ensure"]):
+                    reclip.run_download(job_id, "https://example.org/video", "video", None)
+                self.assertEqual(reclip.jobs[job_id]["status"], "error")
+                self.assertEqual([f for f in files if f.exists()], [])
+
+    def test_failed_download_removes_partial_files(self):
+        reclip.jobs["dlfail"] = {"status": "downloading", "title": "Video"}
+        partial = Path(self.directory.name) / "dlfail.mp4.part"
+        partial.write_bytes(b"incomplete")
+        with patch.object(reclip, "DOWNLOAD_DIR", self.directory.name), \
+                patch.object(reclip.subprocess, "run",
+                             return_value=subprocess.CompletedProcess([], 1, "", "ERROR: HTTP Error 403")):
+            reclip.run_download("dlfail", "https://example.org/video", "video", None)
+        self.assertEqual(reclip.jobs["dlfail"]["error"], "ERROR: HTTP Error 403")
+        self.assertFalse(partial.exists())
+
+    def test_successful_job_keeps_its_file(self):
+        reclip.jobs["keep"] = {"status": "downloading", "title": "Video"}
+        kept = Path(self.directory.name) / "keep.mp4"
+        kept.write_bytes(b"media")
+        with patch.object(reclip, "DOWNLOAD_DIR", self.directory.name), \
+                patch.object(reclip.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(reclip, "ensure_compatible_mp4", return_value=str(kept)):
+            reclip.run_download("keep", "https://example.org/video", "video", None)
+        self.assertEqual(reclip.jobs["keep"]["status"], "done")
+        self.assertTrue(kept.exists())
+
     def test_partial_files_are_never_published(self):
         reclip.jobs["partial"] = {"status": "downloading", "title": "Video"}
         (Path(self.directory.name) / "partial.mp4.part").write_bytes(b"incomplete")

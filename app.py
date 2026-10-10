@@ -228,6 +228,14 @@ def run_download(job_id, url, format_choice, format_id):
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
+    finally:
+        # A failed job exposes no file, so nothing could ever retrieve or delete what it left behind.
+        if job["status"] != "done":
+            for leftover in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
 
 
 @app.route("/")
