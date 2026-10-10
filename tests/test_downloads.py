@@ -182,9 +182,10 @@ class DownloadResponseTests(unittest.TestCase):
 class EmbeddedPlayerFallbackTests(unittest.TestCase):
     PAGE = "https://site.example/video/1/clip/"
 
-    def fake_page(self, html):
+    def fake_page(self, html, final_url=None):
         response = unittest.mock.MagicMock()
         response.__enter__.return_value = response
+        response.geturl.return_value = final_url or self.PAGE
         response.read.return_value = html.encode()
         response.headers.get_content_charset.return_value = "utf-8"
         return patch.object(reclip.urllib.request, "urlopen", return_value=response)
@@ -200,7 +201,8 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
             <iframe></iframe>
         """
         with self.fake_page(html):
-            urls = reclip.find_embed_urls(self.PAGE)
+            page, urls = reclip.find_embed_urls(self.PAGE)
+        self.assertEqual(page, self.PAGE)
         self.assertEqual(urls, [
             "https://player.example/embed/9/",
             "https://site.example/relative/player",
@@ -210,11 +212,29 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
     def test_unrelated_iframes_are_never_treated_as_the_video(self):
         html = '<iframe src="https://ads.example/banner"></iframe><iframe src="https://track.example/x"></iframe>'
         with self.fake_page(html):
-            self.assertEqual(reclip.find_embed_urls(self.PAGE), [])
+            self.assertEqual(reclip.find_embed_urls(self.PAGE), (self.PAGE, []))
 
     def test_unreachable_page_yields_no_embeds(self):
         with patch.object(reclip.urllib.request, "urlopen", side_effect=OSError("down")):
-            self.assertEqual(reclip.find_embed_urls(self.PAGE), [])
+            self.assertEqual(reclip.find_embed_urls(self.PAGE), (self.PAGE, []))
+
+    def test_relative_players_resolve_against_the_post_redirect_page(self):
+        final = "https://canonical.example/watch/1/"
+        with self.fake_page('<iframe src="/embed/5"></iframe>', final_url=final):
+            page, urls = reclip.find_embed_urls(self.PAGE)
+        self.assertEqual((page, urls), (final, ["https://canonical.example/embed/5"]))
+
+    def test_redirected_page_is_used_as_referer(self):
+        final = "https://canonical.example/watch/1/"
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return self.completed(1, "ERROR: Unsupported URL: x") if cmd[-1] == self.PAGE else self.completed(0)
+
+        with patch.object(reclip, "find_embed_urls", return_value=(final, ["https://canonical.example/embed/5"])),                 patch.object(reclip.subprocess, "run", side_effect=fake_run):
+            reclip.run_ytdlp([], self.PAGE, 60)
+        self.assertEqual(calls[-1], ["yt-dlp", "--referer", final, "https://canonical.example/embed/5"])
 
     def completed(self, code, stderr=""):
         return subprocess.CompletedProcess([], code, "{}", stderr)
@@ -226,7 +246,7 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
             calls.append(cmd)
             return self.completed(1, "ERROR: Unsupported URL: x") if cmd[-1] == self.PAGE else self.completed(0)
 
-        with patch.object(reclip, "find_embed_urls", return_value=["https://p.example/a", "https://p.example/b"]), \
+        with patch.object(reclip, "find_embed_urls", return_value=(self.PAGE, ["https://p.example/a", "https://p.example/b"])), \
                 patch.object(reclip.subprocess, "run", side_effect=fake_run):
             result = reclip.run_ytdlp(["--no-playlist", "-j"], self.PAGE, 60)
         self.assertEqual(result.returncode, 0)
@@ -239,7 +259,7 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
             self.assertEqual(reclip.run_ytdlp([], self.PAGE, 60).returncode, 1)
 
     def test_original_error_is_reported_when_no_embed_works(self):
-        with patch.object(reclip, "find_embed_urls", return_value=["https://p.example/a"]), \
+        with patch.object(reclip, "find_embed_urls", return_value=(self.PAGE, ["https://p.example/a"])), \
                 patch.object(reclip.subprocess, "run", return_value=self.completed(1, "ERROR: Unsupported URL: x")):
             result = reclip.run_ytdlp([], self.PAGE, 60)
         self.assertIn("Unsupported URL", result.stderr)

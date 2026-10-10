@@ -50,19 +50,24 @@ class EmbedFinder(HTMLParser):
 
 
 def find_embed_urls(page_url):
-    """Return http(s) player URLs embedded in a page.
+    """Return ``(final_page_url, player_urls)`` for the http(s) players a page embeds.
+
+    The final URL is the one after redirects: relative player URLs resolve against it
+    and it is the right Referer for the players.
 
     og:video / twitter:player metas name the page's main video, so they come first and are
     always kept. A bare iframe is only kept when its URL looks like a player (embed/player),
     which keeps advertising frames from being mistaken for the video.
     """
+    original_url = page_url
     try:
         req = urllib.request.Request(page_url, headers={"User-Agent": BROWSER_UA})
         with urllib.request.urlopen(req, timeout=15) as response:
+            page_url = response.geturl() or page_url
             charset = response.headers.get_content_charset() or "utf-8"
             html = response.read(MAX_PAGE_BYTES).decode(charset, "replace")
     except Exception:
-        return []
+        return original_url, []
     finder = EmbedFinder()
     finder.feed(html)
     found = []
@@ -73,7 +78,7 @@ def find_embed_urls(page_url):
         parsed = urlparse(absolute)
         if parsed.scheme in {"http", "https"} and (explicit or PLAYER_HINT.search(parsed.netloc + parsed.path)):
             found.append(absolute)
-    return found[:MAX_EMBEDS]
+    return page_url, found[:MAX_EMBEDS]
 
 
 def run_ytdlp(args, url, timeout):
@@ -94,8 +99,9 @@ def run_ytdlp(args, url, timeout):
     result = run([], url)
     if result.returncode == 0 or "Unsupported URL" not in result.stderr:
         return result
-    for embed in find_embed_urls(url):
-        retry = run(["--referer", url], embed)
+    page_url, embeds = find_embed_urls(url)
+    for embed in embeds:
+        retry = run(["--referer", page_url], embed)
         if retry.returncode == 0:
             return retry
     return result
