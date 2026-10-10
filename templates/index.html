@@ -585,6 +585,8 @@
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
+      } else if (c.status === 'saving') {
+        actionHtml = `<span class="card-status downloading"><span class="spin"></span> Preparing file...</span>`;
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
@@ -679,13 +681,36 @@
       }, 1000);
     }
 
-    function saveCard(idx) {
+    async function saveCard(idx) {
       const c = cardData[idx];
-      if (!c.jobId) return;
-      const a = document.createElement('a');
-      a.href = `/api/file/${c.jobId}`;
-      a.download = c.filename || '';
-      a.click();
+      if (!c.jobId || c.status === 'saving') return;
+      c.status = 'saving';
+      renderCard(idx);
+      try {
+        const url = `/api/file/${c.jobId}`;
+        // Validate the file response without buffering the full video in memory.
+        const res = await fetch(url, { method: 'HEAD' });
+        if (!res.ok) {
+          throw new Error(`Could not retrieve the download (HTTP ${res.status}). Try again.`);
+        }
+        const contentType = (res.headers.get('Content-Type') || '').split(';')[0];
+        const expectedType = (c.filename || '').toLowerCase().endsWith('.mp3') ? 'audio/mpeg' : 'video/mp4';
+        if (contentType !== expectedType) {
+          throw new Error('The server did not return the requested media file. Try again.');
+        }
+        c.status = 'done';
+        renderCard(idx);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = c.filename || '';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } catch (err) {
+        c.status = 'error';
+        c.error = err.message;
+        renderCard(idx);
+      }
     }
 
     async function dlAll() {

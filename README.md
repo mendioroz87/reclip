@@ -13,6 +13,7 @@ https://github.com/user-attachments/assets/419d3e50-c933-444b-8cab-a9724986ba05
 
 - Download videos from 1000+ supported sites (via [yt-dlp](https://github.com/yt-dlp/yt-dlp))
 - MP4 video or MP3 audio extraction
+- MP4 compatibility: H.264 video, AAC audio, and fast-start playback; compatible streams are copied without re-encoding
 - Quality/resolution picker
 - Bulk downloads — paste multiple URLs at once
 - Automatic URL deduplication
@@ -50,12 +51,27 @@ Anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supporte
 
 YouTube, TikTok, Instagram, Twitter/X, Reddit, Facebook, Vimeo, Twitch, Dailymotion, SoundCloud, Loom, Streamable, Pinterest, Tumblr, Threads, LinkedIn, and many more.
 
+If a page has no extractor of its own but embeds a player from another host (an `<iframe>` or
+`og:video` tag), ReClip retries yt-dlp on that player, using the page as the `Referer`.
+
+Downloads from slow hosts can exceed the default 5-minute limit; raise it with
+`RECLIP_DOWNLOAD_TIMEOUT` (seconds).
+
 ## Stack
 
 - **Backend:** Python + Flask (~150 lines)
 - **Frontend:** Vanilla HTML/CSS/JS (single file, no build step)
 - **Download engine:** [yt-dlp](https://github.com/yt-dlp/yt-dlp) + [ffmpeg](https://ffmpeg.org/)
 - **Dependencies:** 2 (Flask, yt-dlp)
+
+## Validation
+
+With the Python dependencies and FFmpeg installed, run `python -m unittest discover -s tests -v`.
+The media tests generate short fixtures and verify the output codecs and playback decoding.
+Run `node tests/test_download_ui.cjs` to check that the browser rejects failed or non-media file responses before starting a save.
+
+Video conversion runs before a download is marked ready. If conversion takes too long,
+try a lower resolution. MP3 downloads skip this step.
 
 ## Disclaimer
 

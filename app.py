@@ -1,9 +1,15 @@
 import os
+import re
 import uuid
 import glob
 import json
 import subprocess
 import threading
+import time
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
@@ -11,6 +17,157 @@ DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 jobs = {}
+
+# Partial downloads and sidecar files yt-dlp may leave next to the finished video.
+NON_VIDEO_SUFFIXES = {
+    ".part", ".ytdl", ".temp", ".tmp", ".json", ".description", ".txt",
+    ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt", ".ass", ".lrc",
+}
+
+# Seconds yt-dlp may spend downloading one video. Slow hosts need more.
+DOWNLOAD_TIMEOUT = int(os.environ.get("RECLIP_DOWNLOAD_TIMEOUT", 300))
+MAX_EMBEDS = 3
+MAX_PAGE_BYTES = 2_000_000
+PLAYER_HINT = re.compile(r"embed|player", re.I)
+PLAYER_META = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player"}
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+
+
+class EmbedFinder(HTMLParser):
+    """Collect the players a page embeds: og:video / twitter:player metas and iframes."""
+
+    def __init__(self):
+        super().__init__()
+        self.players = []
+        self.frames = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "iframe":
+            self.frames.append(attrs.get("src"))
+        elif tag == "meta" and (attrs.get("property") or attrs.get("name")) in PLAYER_META:
+            self.players.append(attrs.get("content"))
+
+
+def find_embed_urls(page_url):
+    """Return ``(final_page_url, player_urls)`` for the http(s) players a page embeds.
+
+    The final URL is the one after redirects: relative player URLs resolve against it
+    and it is the right Referer for the players.
+
+    og:video / twitter:player metas name the page's main video, so they come first and are
+    always kept. A bare iframe is only kept when its URL looks like a player (embed/player),
+    which keeps advertising frames from being mistaken for the video.
+    """
+    original_url = page_url
+    try:
+        req = urllib.request.Request(page_url, headers={"User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            page_url = response.geturl() or page_url
+            charset = response.headers.get_content_charset() or "utf-8"
+            html = response.read(MAX_PAGE_BYTES).decode(charset, "replace")
+    except Exception:
+        return original_url, []
+    finder = EmbedFinder()
+    finder.feed(html)
+    found = []
+    for raw, explicit in [(r, True) for r in finder.players] + [(r, False) for r in finder.frames]:
+        absolute = urljoin(page_url, raw.strip()) if raw else None
+        if not absolute or absolute == page_url or absolute in found:
+            continue
+        parsed = urlparse(absolute)
+        if parsed.scheme in {"http", "https"} and (explicit or PLAYER_HINT.search(parsed.netloc + parsed.path)):
+            found.append(absolute)
+    return page_url, found[:MAX_EMBEDS]
+
+
+def run_ytdlp(args, url, timeout):
+    """Run yt-dlp on ``url``; if the page itself is unsupported, retry on the videos it embeds.
+
+    Sites without an extractor often just wrap a player from another host in an
+    iframe, which yt-dlp can extract when given that player URL and the page as Referer.
+    """
+    deadline = time.monotonic() + timeout
+
+    def run(extra, target):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("yt-dlp", timeout)
+        return subprocess.run(["yt-dlp", *args, *extra, target],
+                              capture_output=True, text=True, timeout=remaining)
+
+    result = run([], url)
+    if result.returncode == 0 or "Unsupported URL" not in result.stderr:
+        return result
+    page_url, embeds = find_embed_urls(url)
+    for embed in embeds:
+        retry = run(["--referer", page_url], embed)
+        if retry.returncode == 0:
+            return retry
+    return result
+
+
+def safe_filename(title, extension, fallback):
+    """Build a title-based filename that is safe for a download header."""
+    title = " ".join((title or "").split())
+    title = "".join(c for c in title if c not in r'\/:*?"<>|' and ord(c) >= 32 and ord(c) != 127)
+    title = title[:100].strip(" .")
+    return f"{title}{extension}" if title else fallback
+
+
+def probe_media(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode:
+        raise RuntimeError("Could not inspect the downloaded video.")
+    return json.loads(result.stdout)["streams"]
+
+
+def ensure_compatible_mp4(filename):
+    """Produce H.264/AAC MP4; copy streams that already meet the requirements."""
+    source = Path(filename)
+    streams = probe_media(source)
+    # Cover art is stored as a video stream flagged attached_pic; it is not the video.
+    video = next((s for s in streams if s["codec_type"] == "video"
+                  and not s.get("disposition", {}).get("attached_pic")), None)
+    audio = next((s for s in streams if s["codec_type"] == "audio"), None)
+    if not video:
+        raise RuntimeError("The downloaded file has no video track.")
+    copy_video = (
+        video.get("codec_name") == "h264" and video.get("pix_fmt") == "yuv420p"
+        and video.get("profile") in {"Baseline", "Constrained Baseline", "Main", "High"}
+    )
+    copy_audio = not audio or (audio.get("codec_name") == "aac" and audio.get("profile") == "LC")
+    target = source.with_suffix(".mp4")
+    temporary = source.with_name(source.stem + ".compatible.mp4")
+    cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source),
+           "-map", f"0:{video['index']}", "-map", "0:a:0?", "-c:v", "copy" if copy_video else "libx264"]
+    if not copy_video:
+        cmd += ["-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-threads", "2"]
+    cmd += ["-c:a", "copy" if copy_audio else "aac"]
+    if not copy_audio:
+        cmd += ["-profile:a", "aac_low", "-b:a", "192k"]
+    cmd += ["-movflags", "+faststart", str(temporary)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            raise RuntimeError("Video conversion failed: " + result.stderr.strip()[-500:])
+        output = probe_media(temporary)
+        v = next((s for s in output if s["codec_type"] == "video"), None)
+        a = next((s for s in output if s["codec_type"] == "audio"), None)
+        if (not v or v.get("codec_name") != "h264" or v.get("pix_fmt") != "yuv420p"
+                or (audio and not a)
+                or (a and (a.get("codec_name") != "aac" or a.get("profile") != "LC"))):
+            raise RuntimeError("The converted file did not pass compatibility checks.")
+        os.replace(temporary, target)
+        if source != target:
+            source.unlink()
+        return str(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def parse_ytdlp_json(stdout):
@@ -33,19 +190,17 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    args = ["--no-playlist", "-o", out_template]
 
     if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
+        args += ["-x", "--audio-format", "mp3"]
     elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
+        args += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
     else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
+        args += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = run_ytdlp(args, url, DOWNLOAD_TIMEOUT)
         if result.returncode != 0:
             job["status"] = "error"
             job["error"] = result.stderr.strip().split("\n")[-1]
@@ -59,10 +214,19 @@ def run_download(job_id, url, format_choice, format_id):
 
         if format_choice == "audio":
             target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
+            if not target:
+                raise RuntimeError("Download completed but no MP3 file was found")
+            chosen = target[0]
         else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
+            # Any container yt-dlp leaves behind (.m4v, .3gp, .ts, ...) is a candidate;
+            # ffprobe in ensure_compatible_mp4 decides whether it is really video.
+            completed = sorted(
+                (f for f in files if Path(f).suffix.lower() not in NON_VIDEO_SUFFIXES),
+                key=lambda f: Path(f).suffix.lower() != ".mp4",
+            )
+            if not completed:
+                raise RuntimeError("Download completed but no video file was found")
+            chosen = ensure_compatible_mp4(completed[0])
 
         for f in files:
             if f != chosen:
@@ -71,22 +235,24 @@ def run_download(job_id, url, format_choice, format_id):
                 except OSError:
                     pass
 
-        job["status"] = "done"
         job["file"] = chosen
         ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-        else:
-            job["filename"] = os.path.basename(chosen)
+        job["filename"] = safe_filename(job.get("title", ""), ext, os.path.basename(chosen))
+        job["status"] = "done"
     except subprocess.TimeoutExpired:
         job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
+        job["error"] = "Download or conversion timed out. Try a lower resolution."
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
+    finally:
+        # A failed job exposes no file, so nothing could ever retrieve or delete what it left behind.
+        if job["status"] != "done":
+            for leftover in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
 
 
 @app.route("/")
@@ -101,9 +267,8 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = run_ytdlp(["--no-playlist", "-j"], url, 60)
         if result.returncode != 0:
             return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
 
@@ -201,6 +366,11 @@ def download_file(job_id):
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
+    if not os.path.isfile(job["file"]):
+        return jsonify({"error": "The download has expired. Download the video again."}), 404
+    # Also handle jobs created before the filename fix was applied.
+    filename = Path(job["filename"])
+    job["filename"] = safe_filename(filename.stem, filename.suffix, os.path.basename(job["file"]))
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
 
 
