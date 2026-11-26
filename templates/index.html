@@ -418,7 +418,7 @@
     }
 
     function parseUrls(text) {
-      return [...new Set(text.split(/[\s,]+/).map(u => u.trim()).filter(u => u.startsWith('http')))];
+      return [...new Set(text.split(/[\s,]+/).map(u => u.trim()).filter(Boolean))];
     }
 
     function fmtDur(s) {
@@ -435,16 +435,8 @@
     }
 
     function friendlyError(err) {
-      if (err.includes('Unsupported URL')) return 'This URL is not supported';
-      if (err.includes('Video unavailable')) return 'Video is unavailable or private';
-      if (err.includes('Private video')) return 'This video is private';
-      if (err.includes('HTTP Error 403')) return 'Access denied by the platform';
-      if (err.includes('HTTP Error 404')) return 'Video not found';
-      if (err.includes('copyright')) return 'Video blocked due to copyright';
-      if (err.includes('geo')) return 'Video not available in your region';
-      if (err.includes('timed out') || err.includes('Timed out')) return 'Request timed out — try again';
-      if (err.includes('network') || err.includes('Network')) return 'Network error — check your connection';
-      return err.length > 80 ? err.slice(0, 80) + '...' : err;
+      if (err === 'Failed to fetch' || err === 'Load failed') return 'Network error — check your connection';
+      return err;
     }
 
     document.getElementById('urls').addEventListener('keydown', e => {
@@ -462,29 +454,42 @@
       container.innerHTML = '';
       cardData = [];
 
-      // Check if youtube playlist URL
-      for (let i = 0; i < urls.length; i++) {
-        if (urls[i].includes('list=')) {
-          const res = await fetch('/api/playlist', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: urls[i] }),
-          });
-          const data = await res.json();
-          if (data.urls) {
-            // replace playlist URL with individual video URLs
-            urls.splice(i, 1, ...data.urls);
+      const items = [];
+      for (const url of urls) {
+        try {
+          let parsed;
+          try {
+            parsed = new URL(url);
+          } catch {
+            throw new Error('Enter a valid public HTTP or HTTPS URL.');
           }
+          if (/(^|\.)youtube\.com$/.test(parsed.hostname) && parsed.searchParams.has('list')) {
+            const response = await fetch('/api/playlist', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url }),
+            });
+            const data = await response.json();
+            if (data.error) throw new Error(data.error);
+            for (const entry of data.urls) items.push({ url: entry });
+          } else {
+            items.push({ url });
+          }
+        } catch (err) {
+          items.push({ url, error: err.message });
         }
       }
 
-      for (let i = 0; i < urls.length; i++) {
-        const url = urls[i];
+      const seen = new Set();
+      for (const { url, error } of items) {
+        if (seen.has(url)) continue;
+        seen.add(url);
         const idx = cardData.length;
         cardData.push({ url, status: 'loading' });
         renderCard(idx);
 
         try {
+          if (error) throw new Error(error);
           const res = await fetch('/api/info', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

@@ -1,0 +1,31 @@
+name: Extraction checks
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - run: node tests/test_download_ui.cjs
+      - name: Download and verify the project's public MP4
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from app import run_ytdlp
+
+          url = "https://raw.githubusercontent.com/mendioroz87/reclip/631c8f98fea9bb82dde274504449225402f48663/assets/preview.mp4"
+          with TemporaryDirectory() as directory:
+              output = Path(directory) / "preview.mp4"
+              result = run_ytdlp(["-o", str(output)], url, 60)
+              result.check_returncode()
+              assert output.read_bytes() == Path("assets/preview.mp4").read_bytes()
+          PY

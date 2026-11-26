@@ -19,10 +19,7 @@ RUN useradd -m -u 1000 reclip && \
     chown -R reclip:reclip /app
 USER reclip
 
-# Put the reclip user's --user installs first so startup yt-dlp updates take effect.
-ENV PATH=/home/reclip/.local/bin:$PATH
 
 EXPOSE 8899
 
-ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
 CMD ["gunicorn", "-b", "0.0.0.0:8899", "-w", "1", "--threads", "4", "--timeout", "600", "--access-logfile", "-", "app:app"]

@@ -6,10 +6,12 @@ import json
 import subprocess
 import threading
 import time
-import urllib.request
-from html.parser import HTMLParser
+import sys
+import tempfile
+from importlib.metadata import version
+from extraction import valid_url
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlsplit, urlunsplit
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
@@ -26,85 +28,74 @@ NON_VIDEO_SUFFIXES = {
 
 # Seconds yt-dlp may spend downloading one video. Slow hosts need more.
 DOWNLOAD_TIMEOUT = int(os.environ.get("RECLIP_DOWNLOAD_TIMEOUT", 300))
-MAX_EMBEDS = 3
-MAX_PAGE_BYTES = 2_000_000
-PLAYER_HINT = re.compile(r"embed|player", re.I)
-PLAYER_META = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player"}
-BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+YTDLP_VERSION = version("yt-dlp")
+ERRORS = {
+    "invalid_url": (400, "Enter a valid public HTTP or HTTPS URL."),
+    "unsupported": (422, "This URL is not supported."),
+    "access_denied": (403, "Access denied by the platform or network policy."),
+    "unavailable": (404, "This content is no longer available."),
+    "extraction": (502, "Could not extract media from this page."),
+    "timeout": (504, "The request timed out. Try again later."),
+    "rate_limit": (429, "The platform is receiving too many requests. Try again later."),
+    "internal": (500, "ReClip could not finish processing this request."),
+}
 
 
-class EmbedFinder(HTMLParser):
-    """Collect the players a page embeds: og:video / twitter:player metas and iframes."""
+def classify(stderr):
+    # Ignore diagnostics preceding the final error and URL text in the error.
+    message = re.sub(r"https?://\S+", "", stderr.lower().rsplit("error: ", 1)[-1])
+    for category, patterns in (
+        ("rate_limit", ("http error 429", "too many requests", "rate limit")),
+        ("access_denied", ("http error 403", "http error 401", "private video", "sign in",
+                           "login required", "drm", "non-public destination", "geo-restricted")),
+        ("timeout", ("timed out", "timeout")),
+        ("unavailable", ("http error 404", "http error 410", "video unavailable", "has been removed")),
+        ("unsupported", ("unsupported url",)),
+    ):
+        if any(token in message for token in patterns):
+            return category
+    return "extraction"
 
-    def __init__(self):
-        super().__init__()
-        self.players = []
-        self.frames = []
 
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == "iframe":
-            self.frames.append(attrs.get("src"))
-        elif tag == "meta" and (attrs.get("property") or attrs.get("name")) in PLAYER_META:
-            self.players.append(attrs.get("content"))
+def record(url, operation, started, category=None, extractor=None):
+    print(json.dumps({"operation": operation, "domain": urlsplit(url).hostname if valid_url(url) else None,
+                      "extractor": extractor, "error_category": category,
+                      "duration_ms": round((time.monotonic() - started) * 1000),
+                      "yt_dlp_version": YTDLP_VERSION}), flush=True)
 
 
-def find_embed_urls(page_url):
-    """Return ``(final_page_url, player_urls)`` for the http(s) players a page embeds.
-
-    The final URL is the one after redirects: relative player URLs resolve against it
-    and it is the right Referer for the players.
-
-    og:video / twitter:player metas name the page's main video, so they come first and are
-    always kept. A bare iframe is only kept when its URL looks like a player (embed/player),
-    which keeps advertising frames from being mistaken for the video.
-    """
-    original_url = page_url
-    try:
-        req = urllib.request.Request(page_url, headers={"User-Agent": BROWSER_UA})
-        with urllib.request.urlopen(req, timeout=15) as response:
-            page_url = response.geturl() or page_url
-            charset = response.headers.get_content_charset() or "utf-8"
-            html = response.read(MAX_PAGE_BYTES).decode(charset, "replace")
-    except Exception:
-        return original_url, []
-    finder = EmbedFinder()
-    finder.feed(html)
-    found = []
-    for raw, explicit in [(r, True) for r in finder.players] + [(r, False) for r in finder.frames]:
-        absolute = urljoin(page_url, raw.strip()) if raw else None
-        if not absolute or absolute == page_url or absolute in found:
-            continue
-        parsed = urlparse(absolute)
-        if parsed.scheme in {"http", "https"} and (explicit or PLAYER_HINT.search(parsed.netloc + parsed.path)):
-            found.append(absolute)
-    return page_url, found[:MAX_EMBEDS]
+def api_error(category):
+    status, message = ERRORS[category]
+    return jsonify(error=message, category=category), status
 
 
 def run_ytdlp(args, url, timeout):
-    """Run yt-dlp on ``url``; if the page itself is unsupported, retry on the videos it embeds.
-
-    Sites without an extractor often just wrap a player from another host in an
-    iframe, which yt-dlp can extract when given that player URL and the page as Referer.
-    """
     deadline = time.monotonic() + timeout
+    with tempfile.TemporaryDirectory() as directory:
+        report = Path(directory) / "embeds.json"
 
-    def run(extra, target):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired("yt-dlp", timeout)
-        return subprocess.run(["yt-dlp", *args, *extra, target],
-                              capture_output=True, text=True, timeout=remaining)
+        def run(extra, target):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("yt-dlp", timeout)
+            return subprocess.run([sys.executable, str(Path(__file__).with_name("extract_worker.py")),
+                                   str(report), *args, *extra, target],
+                                  capture_output=True, text=True, timeout=remaining)
 
-    result = run([], url)
-    if result.returncode == 0 or "Unsupported URL" not in result.stderr:
+        result = run([], url)
+        if result.returncode and classify(result.stderr) == "unsupported" and report.exists():
+            page, candidates = json.loads(report.read_text())
+            parts = urlsplit(page)
+            for candidate in candidates:
+                referer = urlunsplit((parts.scheme, parts.netloc,
+                                      parts.path if urlsplit(candidate)[:2] == parts[:2] else "/",
+                                      "", ""))
+                result = run(["--referer", referer], candidate)
+                if not result.returncode or classify(result.stderr) != "unsupported":
+                    break
+        trace = report.with_suffix(".extractor")
+        result.extractor = trace.read_text() if trace.exists() else None
         return result
-    page_url, embeds = find_embed_urls(url)
-    for embed in embeds:
-        retry = run(["--referer", page_url], embed)
-        if retry.returncode == 0:
-            return retry
-    return result
 
 
 def safe_filename(title, extension, fallback):
@@ -117,7 +108,7 @@ def safe_filename(title, extension, fallback):
 
 def probe_media(path):
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
+        ["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-of", "json", str(path)],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode:
@@ -142,7 +133,7 @@ def ensure_compatible_mp4(filename):
     copy_audio = not audio or (audio.get("codec_name") == "aac" and audio.get("profile") == "LC")
     target = source.with_suffix(".mp4")
     temporary = source.with_name(source.stem + ".compatible.mp4")
-    cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source),
+    cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-protocol_whitelist", "file,pipe", "-i", str(source),
            "-map", f"0:{video['index']}", "-map", "0:a:0?", "-c:v", "copy" if copy_video else "libx264"]
     if not copy_video:
         cmd += ["-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
@@ -187,6 +178,8 @@ def parse_ytdlp_json(stdout):
 
 
 def run_download(job_id, url, format_choice, format_id):
+    started = time.monotonic()
+    extractor = None
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
@@ -201,16 +194,15 @@ def run_download(job_id, url, format_choice, format_id):
 
     try:
         result = run_ytdlp(args, url, DOWNLOAD_TIMEOUT)
+        extractor = result.extractor
         if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
+            category = classify(result.stderr)
+            job.update(category=category, error=ERRORS[category][1], status="error")
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
         if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
-            return
+            raise RuntimeError("Missing downloaded file")
 
         if format_choice == "audio":
             target = [f for f in files if f.endswith(".mp3")]
@@ -240,12 +232,11 @@ def run_download(job_id, url, format_choice, format_id):
         job["filename"] = safe_filename(job.get("title", ""), ext, os.path.basename(chosen))
         job["status"] = "done"
     except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download or conversion timed out. Try a lower resolution."
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
+        job.update(category="timeout", error=ERRORS["timeout"][1], status="error")
+    except Exception:
+        job.update(category="internal", error=ERRORS["internal"][1], status="error")
     finally:
+        record(url, "download", started, job.get("category"), extractor)
         # A failed job exposes no file, so nothing could ever retrieve or delete what it left behind.
         if job["status"] != "done":
             for leftover in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
@@ -262,17 +253,37 @@ def index():
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+    return extract_metadata("info")
 
+
+def request_data():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def request_url(data):
+    value = data.get("url")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def extract_metadata(operation):
+    started = time.monotonic()
+    url = request_url(request_data())
+    category = extractor = None
     try:
-        result = run_ytdlp(["--no-playlist", "-j"], url, 60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
+        if not valid_url(url):
+            category = "invalid_url"
+            return api_error(category)
+        args = ["--flat-playlist", "-J"] if operation == "playlist" else ["--no-playlist", "-j"]
+        result = run_ytdlp(args, url, 60)
+        extractor = result.extractor
+        if result.returncode:
+            category = classify(result.stderr)
+            return api_error(category)
         info = parse_ytdlp_json(result.stdout)
+        extractor = extractor or info.get("extractor_key")
+        if operation == "playlist":
+            return jsonify(urls=[e["url"] for e in info.get("entries", []) if e and e.get("url")])
 
         # Build quality options — keep best format per resolution
         best_by_height = {}
@@ -300,47 +311,34 @@ def get_info():
             "formats": formats,
         })
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching video info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        category = "timeout"
+    except (ValueError, KeyError):
+        category = "extraction"
+    except Exception:
+        category = "internal"
+    finally:
+        record(url, operation, started, category, extractor)
+    return api_error(category)
 
 
 @app.route("/api/playlist", methods=["POST"])
 def get_playlist_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = json.loads(result.stdout)
-        entries = info.get("entries", [])
-        urls = [entry.get("url") for entry in entries if entry.get("url")]
-        return jsonify({"urls": urls})
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching playlist info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    return extract_metadata("playlist")
 
 
 @app.route("/api/download", methods=["POST"])
 def start_download():
-    data = request.json
-    url = data.get("url", "").strip()
+    data = request_data()
+    url = request_url(data)
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
     title = data.get("title", "")
 
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+    if not valid_url(url):
+        return api_error("invalid_url")
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    jobs[job_id] = {"status": "downloading", "title": title}
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -357,6 +355,7 @@ def check_status(job_id):
     return jsonify({
         "status": job["status"],
         "error": job.get("error"),
+        "category": job.get("category"),
         "filename": job.get("filename"),
     })
 
