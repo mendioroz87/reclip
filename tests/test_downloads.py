@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as reclip
+from extraction import find_embed_urls, valid_url
 
 
 class DownloadResponseTests(unittest.TestCase):
@@ -108,7 +109,7 @@ class DownloadResponseTests(unittest.TestCase):
                 patch.object(reclip.subprocess, "run",
                              return_value=subprocess.CompletedProcess([], 1, "", "ERROR: HTTP Error 403")):
             reclip.run_download("dlfail", "https://example.org/video", "video", None)
-        self.assertEqual(reclip.jobs["dlfail"]["error"], "ERROR: HTTP Error 403")
+        self.assertEqual(reclip.jobs["dlfail"]["category"], "access_denied")
         self.assertFalse(partial.exists())
 
     def test_successful_job_keeps_its_file(self):
@@ -182,87 +183,56 @@ class DownloadResponseTests(unittest.TestCase):
 class EmbeddedPlayerFallbackTests(unittest.TestCase):
     PAGE = "https://site.example/video/1/clip/"
 
-    def fake_page(self, html, final_url=None):
-        response = unittest.mock.MagicMock()
-        response.__enter__.return_value = response
-        response.geturl.return_value = final_url or self.PAGE
-        response.read.return_value = html.encode()
-        response.headers.get_content_charset.return_value = "utf-8"
-        return patch.object(reclip.urllib.request, "urlopen", return_value=response)
+    def test_relative_and_lazy_players_resolve_against_final_page(self):
+        self.assertEqual(find_embed_urls(self.PAGE, """
+            <iframe src="/ads"></iframe><iframe data-src="/player/77"></iframe>
+            <meta property="og:video" content="/embed/9">
+            <iframe src="/embed/9"></iframe><iframe src="http://127.0.0.1/player"></iframe>
+        """), ["https://site.example/embed/9", "https://site.example/player/77"])
 
-    def test_embeds_are_found_metas_first_resolved_and_filtered(self):
-        html = """
-            <iframe src="//ads.example/frame"></iframe>
-            <iframe src="javascript:alert(1)"></iframe>
-            <iframe src="/relative/player"></iframe>
-            <iframe src="https://cdn.example/embed/77/"></iframe>
-            <meta property="og:video" content="https://player.example/embed/9/">
-            <meta property="og:video" content="https://player.example/embed/9/">
-            <iframe></iframe>
-        """
-        with self.fake_page(html):
-            page, urls = reclip.find_embed_urls(self.PAGE)
-        self.assertEqual(page, self.PAGE)
-        self.assertEqual(urls, [
-            "https://player.example/embed/9/",
-            "https://site.example/relative/player",
-            "https://cdn.example/embed/77/",
-        ])
-
-    def test_unrelated_iframes_are_never_treated_as_the_video(self):
-        html = '<iframe src="https://ads.example/banner"></iframe><iframe src="https://track.example/x"></iframe>'
-        with self.fake_page(html):
-            self.assertEqual(reclip.find_embed_urls(self.PAGE), (self.PAGE, []))
-
-    def test_unreachable_page_yields_no_embeds(self):
-        with patch.object(reclip.urllib.request, "urlopen", side_effect=OSError("down")):
-            self.assertEqual(reclip.find_embed_urls(self.PAGE), (self.PAGE, []))
-
-    def test_relative_players_resolve_against_the_post_redirect_page(self):
-        final = "https://canonical.example/watch/1/"
-        with self.fake_page('<iframe src="/embed/5"></iframe>', final_url=final):
-            page, urls = reclip.find_embed_urls(self.PAGE)
-        self.assertEqual((page, urls), (final, ["https://canonical.example/embed/5"]))
-
-    def test_redirected_page_is_used_as_referer(self):
-        final = "https://canonical.example/watch/1/"
+    def test_denied_embed_preserves_error_and_stops(self):
         calls = []
 
-        def fake_run(cmd, **kwargs):
+        def run(cmd, **kwargs):
             calls.append(cmd)
-            return self.completed(1, "ERROR: Unsupported URL: x") if cmd[-1] == self.PAGE else self.completed(0)
+            if len(calls) == 1:
+                Path(cmd[2]).write_text(json.dumps([self.PAGE + "?token=private",
+                    ["https://external.example/player", "https://site.example/embed/other"]]))
+                return subprocess.CompletedProcess(cmd, 1, "", "ERROR: Unsupported URL")
+            return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 403")
 
-        with patch.object(reclip, "find_embed_urls", return_value=(final, ["https://canonical.example/embed/5"])),                 patch.object(reclip.subprocess, "run", side_effect=fake_run):
-            reclip.run_ytdlp([], self.PAGE, 60)
-        self.assertEqual(calls[-1], ["yt-dlp", "--referer", final, "https://canonical.example/embed/5"])
-
-    def completed(self, code, stderr=""):
-        return subprocess.CompletedProcess([], code, "{}", stderr)
-
-    def test_unsupported_page_retries_embed_with_referer(self):
-        calls = []
-
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            return self.completed(1, "ERROR: Unsupported URL: x") if cmd[-1] == self.PAGE else self.completed(0)
-
-        with patch.object(reclip, "find_embed_urls", return_value=(self.PAGE, ["https://p.example/a", "https://p.example/b"])), \
-                patch.object(reclip.subprocess, "run", side_effect=fake_run):
-            result = reclip.run_ytdlp(["--no-playlist", "-j"], self.PAGE, 60)
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(calls[-1], ["yt-dlp", "--no-playlist", "-j", "--referer", self.PAGE, "https://p.example/a"])
-        self.assertEqual(len(calls), 2)
-
-    def test_other_errors_do_not_trigger_embed_search(self):
-        with patch.object(reclip, "find_embed_urls", side_effect=AssertionError("must not search")), \
-                patch.object(reclip.subprocess, "run", return_value=self.completed(1, "ERROR: HTTP Error 403")):
-            self.assertEqual(reclip.run_ytdlp([], self.PAGE, 60).returncode, 1)
-
-    def test_original_error_is_reported_when_no_embed_works(self):
-        with patch.object(reclip, "find_embed_urls", return_value=(self.PAGE, ["https://p.example/a"])), \
-                patch.object(reclip.subprocess, "run", return_value=self.completed(1, "ERROR: Unsupported URL: x")):
+        with patch.object(reclip.subprocess, "run", side_effect=run):
             result = reclip.run_ytdlp([], self.PAGE, 60)
-        self.assertIn("Unsupported URL", result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("https://site.example/", calls[1])
+        self.assertEqual(reclip.classify(result.stderr), "access_denied")
+
+    def test_errors_and_redaction(self):
+        for category, message in [
+            ("rate_limit", "HTTP Error 429"), ("unavailable", "HTTP Error 410"),
+            ("access_denied", "HTTP Error 401"), ("timeout", "timed out"),
+            ("unsupported", "Unsupported URL"), ("extraction", "unknown failure"),
+        ]:
+            error = subprocess.CompletedProcess([], 1, "", message + " https://site.example/?secret")
+            with patch.object(reclip.subprocess, "run", return_value=error) as run, patch("builtins.print") as log:
+                response = reclip.app.test_client().post("/api/info", json={"url": self.PAGE+"?secret"})
+            self.assertEqual(response.json["category"], category)
+            self.assertNotIn("secret", response.text + str(log.call_args))
+            run.assert_called_once()
+
+    def test_invalid_input_and_network_policy(self):
+        for url in ["file:///etc", "http://localhost", "http://127.0.0.1/a",
+                    "http://[::ffff:10.0.0.1]", "https://user:pass@site.example"]:
+            self.assertFalse(valid_url(url))
+            for route in ("info", "playlist", "download"):
+                response = reclip.app.test_client().post("/api/" + route, json={"url": url})
+                self.assertEqual(response.json["category"], "invalid_url")
+        from extract_worker import guard_network
+        import socket
+        with socket.socket() as sock:
+            for host in ("127.0.0.1", "169.254.169.254", "10.0.0.1", "::1"):
+                with self.assertRaises(PermissionError):
+                    guard_network("socket.connect", (sock, (host, 443)))
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg and ffprobe required")

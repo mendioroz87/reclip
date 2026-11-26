@@ -9,10 +9,6 @@ if ! command -v python3 &> /dev/null; then
     missing="$missing python3"
 fi
 
-if ! command -v yt-dlp &> /dev/null; then
-    missing="$missing yt-dlp"
-fi
-
 if ! command -v ffmpeg &> /dev/null; then
     missing="$missing ffmpeg"
 fi
@@ -34,18 +30,9 @@ fi
 if [ ! -d "venv" ]; then
     echo "Setting up virtual environment..."
     python3 -m venv venv
-    source venv/bin/activate
-    pip install -q flask yt-dlp
-else
-    source venv/bin/activate
 fi
-
-# Keep yt-dlp fresh — sites (Instagram, Facebook, etc.) break its extractors
-# frequently, and the usual fix is simply updating yt-dlp. Skip with RECLIP_NO_UPDATE=1.
-if [ -z "$RECLIP_NO_UPDATE" ]; then
-    echo "Updating yt-dlp..."
-    pip install -q -U yt-dlp || echo "  (couldn't update yt-dlp — continuing with the installed version)"
-fi
+source venv/bin/activate
+pip install -q -r requirements.txt
 
 PORT="${PORT:-8899}"
 export PORT
