@@ -418,7 +418,7 @@
     }
 
     function parseUrls(text) {
-      return [...new Set(text.split(/[\s,]+/).map(u => u.trim()).filter(u => u.startsWith('http')))];
+      return [...new Set(text.split(/[\s,]+/).map(u => u.trim()).filter(Boolean))];
     }
 
     function fmtDur(s) {
@@ -435,16 +435,8 @@
     }
 
     function friendlyError(err) {
-      if (err.includes('Unsupported URL')) return 'This URL is not supported';
-      if (err.includes('Video unavailable')) return 'Video is unavailable or private';
-      if (err.includes('Private video')) return 'This video is private';
-      if (err.includes('HTTP Error 403')) return 'Access denied by the platform';
-      if (err.includes('HTTP Error 404')) return 'Video not found';
-      if (err.includes('copyright')) return 'Video blocked due to copyright';
-      if (err.includes('geo')) return 'Video not available in your region';
-      if (err.includes('timed out') || err.includes('Timed out')) return 'Request timed out — try again';
-      if (err.includes('network') || err.includes('Network')) return 'Network error — check your connection';
-      return err.length > 80 ? err.slice(0, 80) + '...' : err;
+      if (err === 'Failed to fetch' || err === 'Load failed') return 'Network error — check your connection';
+      return err;
     }
 
     document.getElementById('urls').addEventListener('keydown', e => {
@@ -465,7 +457,12 @@
       const items = [];
       for (const url of urls) {
         try {
-          const parsed = new URL(url);
+          let parsed;
+          try {
+            parsed = new URL(url);
+          } catch {
+            throw new Error('Enter a valid public HTTP or HTTPS URL.');
+          }
           if (/(^|\.)youtube\.com$/.test(parsed.hostname) && parsed.searchParams.has('list')) {
             const response = await fetch('/api/playlist', {
               method: 'POST',

@@ -46,7 +46,7 @@ async function scenario({ status, contentType, filename, expected }) {
 async function checkMultipleLinks() {
   const playlist = 'https://www.youtube.com/playlist?list=example';
   const video = 'https://site.example/watch?list=item';
-  const input = { value: [playlist, video, video].join('\n') };
+  const input = { value: ['invalid', playlist, video, video].join('\n') };
   const button = {};
   const requests = [];
   const context = { URL, document: { getElementById: id =>
@@ -59,7 +59,9 @@ async function checkMultipleLinks() {
   vm.runInContext(script + '\nrenderCard = () => {};', context);
   await vm.runInContext('go()', context);
   assert.deepEqual(requests, [['/api/playlist', playlist], ['/api/info', video]]);
-  assert.equal(vm.runInContext('cardData.map(c => c.status).join(",")', context), 'info-error,ready');
+  assert.equal(vm.runInContext('cardData.map(c => c.status).join(",")', context), 'info-error,info-error,ready');
+  assert.equal(vm.runInContext("friendlyError('Access denied by the platform or network policy.')", context),
+    'Access denied by the platform or network policy.');
   assert.equal(button.disabled, false);
   console.log('PASS multiple links, playlist failure, deduplication and recovery');
 }
