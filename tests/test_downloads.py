@@ -229,6 +229,75 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
                 response = reclip.app.test_client().post("/api/info", json={"url": self.PAGE})
             self.assertEqual((response.json["category"], response.status_code), (category, status))
 
+    def test_instagram_rate_limit_pauses_fetches_and_downloads_until_retry_after(self):
+        reel = "https://www.instagram.com/reel/CWqAgUZgCku/"
+        other_reel = "https://instagram.com/reel/Chunk8-jurw/"
+        client = reclip.app.test_client()
+        self.addCleanup(reclip.jobs.pop, "limited", None)
+        now = 100
+
+        def run(cmd, **kwargs):
+            if cmd[-1] == reel:
+                Path(cmd[2]).with_suffix(".http-429.json").write_text(json.dumps(["www.instagram.com", "30"]))
+                return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 429")
+            return subprocess.CompletedProcess(cmd, 0, '{"title":"Clip"}', "")
+
+        with patch.object(reclip, "instagram_retry_at", 0), \
+                patch.object(reclip.time, "monotonic", side_effect=lambda: now), \
+                patch.object(reclip.subprocess, "run", side_effect=run) as worker:
+            response = client.post("/api/info", json={"url": reel})
+            self.assertEqual((response.status_code, response.headers["Retry-After"]), (429, "30"))
+            self.assertEqual(response.json["retry_after"], 30)
+            now += 10
+            response = client.post("/api/info", json={"url": other_reel})
+            self.assertEqual((response.status_code, response.headers["Retry-After"]), (429, "20"))
+
+            reclip.jobs["limited"] = {"status": "downloading", "title": "Instagram clip"}
+            reclip.run_download("limited", other_reel, "video", None)
+            status = client.get("/api/status/limited").json
+            self.assertEqual((status["status"], status["category"], status["retry_after"]),
+                             ("error", "rate_limit", 20))
+            worker.assert_called_once()
+
+            self.assertEqual(client.post("/api/info", json={"url": self.PAGE}).status_code, 200)
+            now += 20
+            self.assertEqual(client.post("/api/info", json={"url": other_reel}).status_code, 200)
+            self.assertEqual(worker.call_count, 3)
+
+    def test_instagram_login_redirect_is_distinct_from_http_429(self):
+        reel = "https://www.instagram.com/reel/CWqAgUZgCku/"
+        result = subprocess.CompletedProcess([], 1, "", "ERROR: [Instagram] "
+            "The webpage request was redirected to the login page. "
+            "You have exceeded the rate-limit for accessing posts anonymously")
+        with patch.object(reclip, "instagram_retry_at", 0), \
+                patch.object(reclip.subprocess, "run", return_value=result) as worker:
+            response = reclip.app.test_client().post("/api/info", json={"url": reel})
+        worker.assert_called_once()
+        self.assertEqual((response.status_code, response.json["category"]), (403, "login_required"))
+        self.assertNotIn("Retry-After", response.headers)
+
+    def test_only_instagram_responses_set_the_shared_cooldown(self):
+        reel = "https://www.instagram.com/reel/CWqAgUZgCku/"
+        for host, header, expected, cooldown in [
+            ("www.instagram.com", "", 60, 160),
+            ("external.example", "75", 75, 0),
+        ]:
+            with self.subTest(host=host):
+                def run(cmd, **kwargs):
+                    Path(cmd[2]).with_suffix(".http-429.json").write_text(json.dumps([host, header]))
+                    return subprocess.CompletedProcess(cmd, 1, "", "ERROR: HTTP Error 429")
+
+                with patch.object(reclip, "instagram_retry_at", 0), \
+                        patch.object(reclip.time, "monotonic", return_value=100), \
+                        patch.object(reclip.subprocess, "run", side_effect=run):
+                    response = reclip.app.test_client().post("/api/info", json={"url": reel})
+                    self.assertEqual(response.json["retry_after"], expected)
+                    self.assertEqual(reclip.instagram_retry_at, cooldown)
+
+    def test_retry_after_accepts_an_http_date(self):
+        with patch.object(reclip.time, "time", return_value=100.2):
+            self.assertEqual(reclip.parse_retry_after("Thu, 01 Jan 1970 00:02:00 GMT"), 20)
+
     def test_named_platforms_still_dispatch_to_native_extractors(self):
         from yt_dlp.extractor import gen_extractor_classes
         extractors = gen_extractor_classes()

@@ -19,6 +19,11 @@ class FixtureHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         self.server.paths.append(self.path)
+        if self.path == "/limited":
+            self.send_response(429)
+            self.send_header("Retry-After", "17")
+            self.end_headers()
+            return
         if self.path == "/blocked":
             self.send_response(302)
             self.send_header("Location", "http://localhost/private")
@@ -67,6 +72,10 @@ worker.main()
                 return run(cmd, **kwargs)
 
             with patch.object(app.subprocess, "run", side_effect=fixture_run), patch.object(app, "DOWNLOAD_DIR", directory):
+                with self.assertRaises(app.RateLimited) as limited:
+                    app.run_ytdlp(["-j"], url + "/limited", 60)
+                self.assertEqual(limited.exception.retry_after, 17)
+                self.assertEqual(server.paths.count("/limited"), 1)
                 denied = app.run_ytdlp(["-j"], url + "/blocked", 60)
                 self.assertNotEqual(denied.returncode, 0)
                 self.assertEqual(app.classify(denied.stderr), "access_denied")

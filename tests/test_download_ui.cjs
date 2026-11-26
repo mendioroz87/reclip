@@ -57,7 +57,9 @@ async function checkMultipleLinks() {
     } };
   vm.createContext(context);
   vm.runInContext(script + '\nrenderCard = () => {};', context);
+  const pending = vm.runInContext('go()', context);
   await vm.runInContext('go()', context);
+  await pending;
   assert.deepEqual(requests, [['/api/playlist', playlist], ['/api/info', video]]);
   assert.equal(vm.runInContext('cardData.map(c => c.status).join(",")', context), 'info-error,info-error,ready');
   assert.equal(vm.runInContext("friendlyError('Access denied by the platform or network policy.')", context),

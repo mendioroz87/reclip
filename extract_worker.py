@@ -5,11 +5,13 @@ import resource
 import socket
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yt_dlp
 from yt_dlp.utils import Popen
 from yt_dlp.extractor.generic import GenericIE
 from yt_dlp.networking._urllib import RedirectHandler, UrllibRH
+from yt_dlp.networking.exceptions import HTTPError
 
 from extraction import find_embed_urls, public_ip, valid_url
 
@@ -69,6 +71,16 @@ def main():
         def build_request_director(self, handlers, preferences=None):
             # A C-backed optional transport would bypass Python socket auditing.
             return super().build_request_director([UrllibRH], preferences)
+
+        def urlopen(self, req):
+            try:
+                return super().urlopen(req)
+            except HTTPError as error:
+                if error.status == 429:
+                    hostname = urlsplit(error.response.url).hostname
+                    retry_after = error.response.headers.get("Retry-After", "")
+                    report.with_suffix(".http-429.json").write_text(json.dumps([hostname, retry_after[:128]]))
+                raise
 
         def get_info_extractor(self, key):
             extractor = super().get_info_extractor(key)
