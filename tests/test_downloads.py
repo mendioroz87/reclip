@@ -220,6 +220,28 @@ class EmbeddedPlayerFallbackTests(unittest.TestCase):
             self.assertNotIn("secret", response.text + str(log.call_args))
             run.assert_called_once()
 
+    def test_worker_timeout_and_internal_failure_have_distinct_responses(self):
+        for exception, category, status in [
+            (subprocess.TimeoutExpired("worker", 60), "timeout", 504),
+            (FileNotFoundError("worker"), "internal", 500),
+        ]:
+            with patch.object(reclip.subprocess, "run", side_effect=exception):
+                response = reclip.app.test_client().post("/api/info", json={"url": self.PAGE})
+            self.assertEqual((response.json["category"], response.status_code), (category, status))
+
+    def test_named_platforms_still_dispatch_to_native_extractors(self):
+        from yt_dlp.extractor import gen_extractor_classes
+        extractors = gen_extractor_classes()
+        for key, url in [
+            ("Youtube", "https://www.youtube.com/watch?v=BaW_jenozKc"),
+            ("Vimeo", "https://vimeo.com/1084537"),
+            ("Instagram", "https://www.instagram.com/p/CHfixture01/"),
+            ("TikTok", "https://www.tiktok.com/@fixture/video/1234567890123456789"),
+        ]:
+            self.assertTrue(valid_url(url))
+            ie = next(ie for ie in extractors if ie.suitable(url))
+            self.assertEqual(ie.ie_key(), key)
+
     def test_invalid_input_and_network_policy(self):
         for url in ["file:///etc", "http://localhost", "http://127.0.0.1/a",
                     "http://[::ffff:10.0.0.1]", "https://user:pass@site.example"]:

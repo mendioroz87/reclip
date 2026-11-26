@@ -42,7 +42,8 @@ ERRORS = {
 
 
 def classify(stderr):
-    message = stderr.lower()
+    # Ignore diagnostics preceding the final error and URL text in the error.
+    message = re.sub(r"https?://\S+", "", stderr.lower().rsplit("error: ", 1)[-1])
     for category, patterns in (
         ("rate_limit", ("http error 429", "too many requests", "rate limit")),
         ("access_denied", ("http error 403", "http error 401", "private video", "sign in",
@@ -87,7 +88,7 @@ def run_ytdlp(args, url, timeout):
             parts = urlsplit(page)
             for candidate in candidates:
                 referer = urlunsplit((parts.scheme, parts.netloc,
-                                      parts.path if urlsplit(candidate).netloc == parts.netloc else "/",
+                                      parts.path if urlsplit(candidate)[:2] == parts[:2] else "/",
                                       "", ""))
                 result = run(["--referer", referer], candidate)
                 if not result.returncode or classify(result.stderr) != "unsupported":
@@ -195,9 +196,8 @@ def run_download(job_id, url, format_choice, format_id):
         result = run_ytdlp(args, url, DOWNLOAD_TIMEOUT)
         extractor = result.extractor
         if result.returncode != 0:
-            job["status"] = "error"
-            job["category"] = classify(result.stderr)
-            job["error"] = ERRORS[job["category"]][1]
+            category = classify(result.stderr)
+            job.update(category=category, error=ERRORS[category][1], status="error")
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
@@ -232,13 +232,9 @@ def run_download(job_id, url, format_choice, format_id):
         job["filename"] = safe_filename(job.get("title", ""), ext, os.path.basename(chosen))
         job["status"] = "done"
     except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["category"] = "timeout"
-        job["error"] = ERRORS["timeout"][1]
+        job.update(category="timeout", error=ERRORS["timeout"][1], status="error")
     except Exception:
-        job["status"] = "error"
-        job["category"] = "internal"
-        job["error"] = ERRORS["internal"][1]
+        job.update(category="internal", error=ERRORS["internal"][1], status="error")
     finally:
         record(url, "download", started, job.get("category"), extractor)
         # A failed job exposes no file, so nothing could ever retrieve or delete what it left behind.
@@ -285,7 +281,7 @@ def extract_metadata(operation):
             category = classify(result.stderr)
             return api_error(category)
         info = parse_ytdlp_json(result.stdout)
-        extractor = info.get("extractor_key")
+        extractor = extractor or info.get("extractor_key")
         if operation == "playlist":
             return jsonify(urls=[e["url"] for e in info.get("entries", []) if e and e.get("url")])
 

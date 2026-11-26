@@ -9,6 +9,7 @@ from pathlib import Path
 import yt_dlp
 from yt_dlp.utils import Popen
 from yt_dlp.extractor.generic import GenericIE
+from yt_dlp.networking._urllib import RedirectHandler, UrllibRH
 
 from extraction import find_embed_urls, public_ip, valid_url
 
@@ -64,15 +65,26 @@ def main():
             args = restricted
         original_popen(self, args, *pos, **kwargs)
 
-    original_extractor = yt_dlp.YoutubeDL.get_info_extractor
+    class PublicYoutubeDL(yt_dlp.YoutubeDL):
+        def build_request_director(self, handlers, preferences=None):
+            # A C-backed optional transport would bypass Python socket auditing.
+            return super().build_request_director([UrllibRH], preferences)
 
-    def select_extractor(self, key):
-        extractor = original_extractor(self, key)
-        report.with_suffix(".extractor").write_text(extractor.ie_key())
-        return extractor
+        def get_info_extractor(self, key):
+            extractor = super().get_info_extractor(key)
+            report.with_suffix(".extractor").write_text(extractor.ie_key())
+            return extractor
+
+    original_redirect = RedirectHandler.redirect_request
+
+    def public_redirect(self, req, fp, code, msg, headers, newurl):
+        if not valid_url(newurl):
+            raise PermissionError("Non-public destination blocked")
+        return original_redirect(self, req, fp, code, msg, headers, newurl)
 
     Popen.__init__ = local_media_process
-    yt_dlp.YoutubeDL.get_info_extractor = select_extractor
+    yt_dlp.YoutubeDL = PublicYoutubeDL
+    RedirectHandler.redirect_request = public_redirect
     GenericIE._extract_embeds = discover
     sys.addaudithook(guard_network)
     resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))
@@ -80,7 +92,6 @@ def main():
     yt_dlp.main(["--ignore-config", "--no-plugin-dirs", "--no-js-runtimes",
                  "--proxy", "", "--socket-timeout", "15", "--extractor-retries", "0",
                  "--retries", "1", "--fragment-retries", "1", "--max-filesize", "1G",
-
                  *sys.argv[2:-1], "--", url])
 
 

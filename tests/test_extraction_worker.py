@@ -19,6 +19,11 @@ class FixtureHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         self.server.paths.append(self.path)
+        if self.path == "/blocked":
+            self.send_response(302)
+            self.send_header("Location", "http://localhost/private")
+            self.end_headers()
+            return
         super().do_GET()
 
 
@@ -59,12 +64,12 @@ worker.main()
             def fixture_run(cmd, **kwargs):
                 if len(cmd) > 1 and cmd[1] == str(ROOT / "extract_worker.py"):
                     cmd = [cmd[0], str(runner), *cmd[2:]]
-                result = run(cmd, **kwargs)
-                if result.returncode:
-                    print(result.stderr)
-                return result
+                return run(cmd, **kwargs)
 
             with patch.object(app.subprocess, "run", side_effect=fixture_run), patch.object(app, "DOWNLOAD_DIR", directory):
+                denied = app.run_ytdlp(["-j"], url + "/blocked", 60)
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertEqual(app.classify(denied.stderr), "access_denied")
                 meta = app.run_ytdlp(["-j"], url + "/watch.html", 60)
                 self.assertEqual(meta.returncode, 0, meta.stderr)
                 self.assertEqual(server.paths.count("/watch.html"), 1)

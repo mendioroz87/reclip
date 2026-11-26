@@ -42,3 +42,25 @@ async function scenario({ status, contentType, filename, expected }) {
   await scenario({ status: 200, contentType: 'video/mp4', filename: 'Salesforce Microfrontends.mp4', expected: 'done' });
   await scenario({ status: 200, contentType: 'audio/mpeg', filename: 'Audio.mp3', expected: 'done' });
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+async function checkMultipleLinks() {
+  const playlist = 'https://www.youtube.com/playlist?list=example';
+  const video = 'https://site.example/watch?list=item';
+  const input = { value: [playlist, video, video].join('\n') };
+  const button = {};
+  const requests = [];
+  const context = { URL, document: { getElementById: id =>
+    id === 'urls' ? Object.assign(input, { addEventListener() {} }) : button },
+    fetch: async (endpoint, options) => {
+      requests.push([endpoint, JSON.parse(options.body).url]);
+      return { json: async () => endpoint.endsWith('playlist') ? { error: 'Access denied' } : { title: 'Clip' } };
+    } };
+  vm.createContext(context);
+  vm.runInContext(script + '\nrenderCard = () => {};', context);
+  await vm.runInContext('go()', context);
+  assert.deepEqual(requests, [['/api/playlist', playlist], ['/api/info', video]]);
+  assert.equal(vm.runInContext('cardData.map(c => c.status).join(",")', context), 'info-error,ready');
+  assert.equal(button.disabled, false);
+  console.log('PASS multiple links, playlist failure, deduplication and recovery');
+}
+checkMultipleLinks().catch(error => { console.error(error); process.exitCode = 1; });
