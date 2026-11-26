@@ -448,6 +448,7 @@
       if (!urls.length) return;
 
       const btn = document.getElementById('goBtn');
+      if (btn.disabled) return;
       const container = document.getElementById('cards');
       btn.disabled = true;
       btn.textContent = 'Loading...';

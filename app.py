@@ -9,10 +9,13 @@ import time
 import sys
 import tempfile
 from importlib.metadata import version
-from extraction import valid_url
+from math import ceil
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from flask import Flask, request, jsonify, send_file, render_template
+from werkzeug.http import parse_date
+
+from extraction import INSTAGRAM_HOSTS, valid_url
 
 app = Flask(__name__)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
@@ -29,10 +32,14 @@ NON_VIDEO_SUFFIXES = {
 # Seconds yt-dlp may spend downloading one video. Slow hosts need more.
 DOWNLOAD_TIMEOUT = int(os.environ.get("RECLIP_DOWNLOAD_TIMEOUT", 300))
 YTDLP_VERSION = version("yt-dlp")
+INSTAGRAM_RETRY_DELAY = 60
+instagram_retry_at = 0
+instagram_retry_lock = threading.Lock()
 ERRORS = {
     "invalid_url": (400, "Enter a valid public HTTP or HTTPS URL."),
     "unsupported": (422, "This URL is not supported."),
     "access_denied": (403, "Access denied by the platform or network policy."),
+    "login_required": (403, "Instagram asked ReClip to sign in. Open the Reel in a private browser window to check if it is publicly accessible."),
     "unavailable": (404, "This content is no longer available."),
     "extraction": (502, "Could not extract media from this page."),
     "timeout": (504, "The request timed out. Try again later."),
@@ -41,11 +48,28 @@ ERRORS = {
 }
 
 
+class RateLimited(Exception):
+    def __init__(self, extractor, retry_after):
+        message = ERRORS["rate_limit"][1]
+        if retry_after:
+            seconds = "second" if retry_after == 1 else "seconds"
+            message = f"The platform is receiving too many requests. Try again in {retry_after} {seconds}."
+        elif retry_after == 0:
+            message = "The platform is receiving too many requests. You can try again now."
+        super().__init__(message)
+        self.extractor = extractor
+        self.retry_after = retry_after
+
+
 def classify(stderr):
     # Ignore diagnostics preceding the final error and URL text in the error.
     message = re.sub(r"https?://\S+", "", stderr.lower().rsplit("error: ", 1)[-1])
+    if "http error 429" in message:
+        return "rate_limit"
+    if "[instagram]" in message and "redirected to the login page" in message:
+        return "login_required"
     for category, patterns in (
-        ("rate_limit", ("http error 429", "too many requests", "rate limit")),
+        ("rate_limit", ("too many requests", "rate limit", "rate-limit")),
         ("access_denied", ("http error 403", "http error 401", "private video", "sign in",
                            "login required", "drm", "non-public destination", "geo-restricted")),
         ("timeout", ("timed out", "timeout")),
@@ -64,23 +88,62 @@ def record(url, operation, started, category=None, extractor=None):
                       "yt_dlp_version": YTDLP_VERSION}), flush=True)
 
 
-def api_error(category):
+def api_error(category, rate_limit=None):
     status, message = ERRORS[category]
-    return jsonify(error=message, category=category), status
+    if rate_limit is None:
+        return jsonify(error=message, category=category), status
+    response = jsonify(error=str(rate_limit), category=category, retry_after=rate_limit.retry_after)
+    if rate_limit.retry_after is not None:
+        response.headers["Retry-After"] = str(rate_limit.retry_after)
+    return response, status
+
+
+def parse_retry_after(value):
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return int(value)
+    date = parse_date(value)
+    return max(0, ceil(date.timestamp() - time.time())) if date else None
 
 
 def run_ytdlp(args, url, timeout):
     deadline = time.monotonic() + timeout
     with tempfile.TemporaryDirectory() as directory:
         report = Path(directory) / "embeds.json"
+        trace = report.with_suffix(".extractor")
+        rate_limit_report = report.with_suffix(".http-429.json")
 
         def run(extra, target):
+            global instagram_retry_at
+            instagram = urlsplit(target).hostname in INSTAGRAM_HOSTS
+            if instagram:
+                with instagram_retry_lock:
+                    remaining = ceil(instagram_retry_at - time.monotonic())
+                if remaining > 0:
+                    raise RateLimited("Instagram", remaining)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired("yt-dlp", timeout)
-            return subprocess.run([sys.executable, str(Path(__file__).with_name("extract_worker.py")),
-                                   str(report), *args, *extra, target],
-                                  capture_output=True, text=True, timeout=remaining)
+            trace.unlink(missing_ok=True)
+            rate_limit_report.unlink(missing_ok=True)
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name("extract_worker.py")),
+                                     str(report), *args, *extra, target],
+                                    capture_output=True, text=True, timeout=remaining)
+            result.extractor = trace.read_text() if trace.exists() else None
+            if result.returncode and classify(result.stderr) == "rate_limit":
+                host, header = None, ""
+                if rate_limit_report.exists():
+                    host, header = json.loads(rate_limit_report.read_text())
+                retry_after = parse_retry_after(header)
+                if instagram and host in INSTAGRAM_HOSTS:
+                    if retry_after is None:
+                        retry_after = INSTAGRAM_RETRY_DELAY
+                    with instagram_retry_lock:
+                        now = time.monotonic()
+                        instagram_retry_at = max(instagram_retry_at, now + retry_after)
+                        retry_after = ceil(instagram_retry_at - now)
+                raise RateLimited(result.extractor, retry_after)
+            return result
 
         result = run([], url)
         if result.returncode and classify(result.stderr) == "unsupported" and report.exists():
@@ -93,8 +156,6 @@ def run_ytdlp(args, url, timeout):
                 result = run(["--referer", referer], candidate)
                 if not result.returncode or classify(result.stderr) != "unsupported":
                     break
-        trace = report.with_suffix(".extractor")
-        result.extractor = trace.read_text() if trace.exists() else None
         return result
 
 
@@ -231,6 +292,9 @@ def run_download(job_id, url, format_choice, format_id):
         ext = os.path.splitext(chosen)[1]
         job["filename"] = safe_filename(job.get("title", ""), ext, os.path.basename(chosen))
         job["status"] = "done"
+    except RateLimited as error:
+        extractor = error.extractor
+        job.update(category="rate_limit", error=str(error), retry_after=error.retry_after, status="error")
     except subprocess.TimeoutExpired:
         job.update(category="timeout", error=ERRORS["timeout"][1], status="error")
     except Exception:
@@ -269,7 +333,7 @@ def request_url(data):
 def extract_metadata(operation):
     started = time.monotonic()
     url = request_url(request_data())
-    category = extractor = None
+    category = extractor = rate_limit = None
     try:
         if not valid_url(url):
             category = "invalid_url"
@@ -310,6 +374,8 @@ def extract_metadata(operation):
             "uploader": info.get("uploader", ""),
             "formats": formats,
         })
+    except RateLimited as error:
+        category, extractor, rate_limit = "rate_limit", error.extractor, error
     except subprocess.TimeoutExpired:
         category = "timeout"
     except (ValueError, KeyError):
@@ -318,7 +384,7 @@ def extract_metadata(operation):
         category = "internal"
     finally:
         record(url, operation, started, category, extractor)
-    return api_error(category)
+    return api_error(category, rate_limit)
 
 
 @app.route("/api/playlist", methods=["POST"])
@@ -356,6 +422,7 @@ def check_status(job_id):
         "status": job["status"],
         "error": job.get("error"),
         "category": job.get("category"),
+        "retry_after": job.get("retry_after"),
         "filename": job.get("filename"),
     })
 

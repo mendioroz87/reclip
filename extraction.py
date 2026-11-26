@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 MAX_PAGE_BYTES = 2_000_000
+INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "i.instagram.com"}
 PLAYER_HINT = re.compile(r"embed|player", re.I)
 PLAYER_META = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player"}
 
